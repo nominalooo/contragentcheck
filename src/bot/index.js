@@ -1,12 +1,14 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const {
-  getOrCreateUser, getUser, canCheck, incrementFreeChecks,
-  saveCheck, getUserChecks, hasPaidForInn
+  getOrCreateUser, getUser,
+  saveCheck, getUserChecks, hasPaidForInn, createPayment
 } = require('../db/queries');
 const { quickCheck, fullCheck, formatPreview, formatFullReport } = require('../checkers');
-const { createYookassaPayment } = require('../payments');
 const logger = require('../logger');
+
+// 300 RUB = 300 Telegram Stars (1 Star ≈ 1 RUB in Russia)
+const PRICE_STARS = 300;
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -96,22 +98,75 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ─── Оплата за конкретный ИНН ─────────────────────────────────────────────
+// ─── Оплата через Telegram Stars ─────────────────────────────────────────
 bot.action(/^pay_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const inn = ctx.match[1];
-  const user = await getUser(ctx.from.id);
-  if (!user) return ctx.reply('Напишите /start');
+
+  await ctx.replyWithInvoice({
+    title: `Отчёт по ИНН ${inn}`,
+    description: 'Полный отчёт: налоги, суды, банкротство, госконтракты, риск-скор',
+    payload: `report_${inn}`,
+    currency: 'XTR',
+    prices: [{ label: 'Полный отчёт', amount: PRICE_STARS }],
+    provider_token: ''  // empty = Telegram Stars
+  });
+});
+
+// ─── Pre-checkout (обязательно отвечать OK) ───────────────────────────────
+bot.on('pre_checkout_query', async (ctx) => {
+  await ctx.answerPreCheckoutQuery(true);
+});
+
+// ─── Успешная оплата ──────────────────────────────────────────────────────
+bot.on('successful_payment', async (ctx) => {
+  const payload = ctx.message.successful_payment.invoice_payload;
+  const inn = payload.replace('report_', '');
+  const user = await getOrCreateUser(ctx.from.id, ctx.from.username);
+
+  // Save payment to DB
+  await createPayment({
+    user_id: user.id,
+    inn,
+    amount: PRICE_STARS,
+    status: 'succeeded',
+    yookassa_payment_id: `stars_${ctx.message.successful_payment.telegram_payment_charge_id}`
+  }).catch(() => {});
+
+  const loading = await ctx.reply('✅ Оплата получена! Генерирую полный отчёт...');
 
   try {
-    const url = await createYookassaPayment(user.id, inn, ctx.from.id);
-    await ctx.replyWithMarkdown(
-      `💳 Оплата полного отчёта по ИНН *${inn}*\nСтоимость: *300 ₽*`,
-      Markup.inlineKeyboard([[Markup.button.url('Оплатить 300 ₽', url)]])
-    );
+    const result = await fullCheck(inn);
+    const report = formatFullReport(result);
+
+    const risks = [
+      !result.company?.isActive,
+      result.taxDebt?.hasDebt === true,
+      result.bankruptcy?.isBankrupt,
+      (result.arbitr?.total || 0) > 20
+    ].filter(Boolean).length;
+    const riskLevel = risks === 0 ? '🟢 Низкий' : risks === 1 ? '🟡 Средний' : '🔴 Высокий';
+
+    await saveCheck({
+      user_id: user.id,
+      inn,
+      company_name: result.company?.name || null,
+      result,
+      risk_level: riskLevel
+    }).catch(() => {});
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
+
+    if (report.length > 4000) {
+      await ctx.replyWithMarkdown(report.slice(0, 4000));
+      await ctx.replyWithMarkdown(report.slice(4000));
+    } else {
+      await ctx.replyWithMarkdown(report);
+    }
   } catch (e) {
-    logger.error('Payment error', { error: e.message });
-    await ctx.reply('Ошибка создания платежа. Попробуйте позже.');
+    await ctx.telegram.deleteMessage(ctx.chat.id, loading.message_id).catch(() => {});
+    logger.error('Full check after payment failed', { inn, error: e.message });
+    await ctx.reply(`Ошибка при генерации отчёта: ${e.message}`);
   }
 });
 
