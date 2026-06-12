@@ -17,7 +17,8 @@
     "ws": "^8.18.0",
     "winston": "^3.11.0",
     "uuid": "^9.0.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "qrcode": "^1.5.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
